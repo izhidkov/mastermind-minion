@@ -4,6 +4,10 @@ import os.path
 import traceback
 
 import tornado.web
+import tornado.gen
+from tornado.concurrent import run_on_executor
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 from minion.app import app
 from minion.config import config
@@ -19,8 +23,17 @@ class PingHandler(tornado.web.RequestHandler):
     def get(self):
         self.write('OK')
 
+MAX_WORKERS = 4
 
 class AuthenticationRequestHandler(tornado.web.RequestHandler):
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    @run_on_executor
+    def background_task(self, task_to_run):
+        """ This will be executed in `executor` pool. """
+        time.sleep(20)
+        result = task_to_run()
+        return result
+
     def is_authenticated(self):
         if config['common']['debug'] == 'True':
             return True
@@ -72,6 +85,7 @@ def api_response(method):
 class RsyncStartHandler(AuthenticationRequestHandler):
     @AuthenticationRequestHandler.auth_required
     @api_response
+    @tornade.gen.coroutine
     def post(self):
         cmd = self.get_argument('command')
         success_codes = [int(c) for c in self.get_arguments('success_code')]
@@ -82,25 +96,29 @@ class RsyncStartHandler(AuthenticationRequestHandler):
             if header.upper().startswith('ENV_'):
                 env_var_name = header.upper()[len('ENV_'):]
                 env[env_var_name] = value
-        uid = manager.run(cmd, params, env=env, success_codes=success_codes)
+        uid = yield self.background_task(manager.run(cmd, params, env=env, success_codes=success_codes))
         self.set_status(302)
         self.add_header('Location', self.reverse_url('status', uid))
 
 
 @h.route(app, r'/rsync/manual/')
 class RsyncManualHandler(tornado.web.RequestHandler):
+    @tornado.gen.coroutine
     def get(self):
-        self.write(loader.load('manual.html').generate())
+        response = yield loader.load('manual.html').generate()
+        self.write(response)
 
 
 @h.route(app, r'/command/terminate/', name='terminate')
 class CommandTerminateHandler(AuthenticationRequestHandler):
     @AuthenticationRequestHandler.auth_required
     @api_response
+    @tornado.gen.coroutine
     def post(self):
         uid = self.get_argument('cmd_uid')
-        manager.terminate(uid)
-        return {uid: manager.status(uid)}
+        yield self.background_task(manager.terminate(uid))
+        status = yield self.background_task(manager.status(uid))
+        return {uid: status}
 
 
 @h.route(app, r'/command/status/([0-9a-f]+)/', name='status')
@@ -108,18 +126,21 @@ class CommandTerminateHandler(AuthenticationRequestHandler):
 class RsyncStatusHandler(AuthenticationRequestHandler):
     @AuthenticationRequestHandler.auth_required
     @api_response
+    @tornado.gen.coroutine
     def get(self, uid):
-        return {uid: manager.status(uid)}
+        status = yield self.background_task(manager.status(uid))
+        return {uid: status}
 
 
 @h.route(app, r'/node/shutdown/', name='node_shutdown')
 class NodeShutdownHandler(AuthenticationRequestHandler):
     @AuthenticationRequestHandler.auth_required
     @api_response
+    @tornado.gen.coroutine
     def post(self):
         cmd = self.get_argument('command')
         params = dict((k, v[0]) for k, v in self.request.arguments.iteritems())
-        uid = manager.run(cmd, params)
+        uid = yield self.background_task(manager.run(cmd, params))
         self.set_status(302)
         self.add_header('Location', self.reverse_url('status', uid))
 
@@ -129,9 +150,10 @@ class NodeShutdownHandler(AuthenticationRequestHandler):
 class RsyncListHandler(AuthenticationRequestHandler):
     @AuthenticationRequestHandler.auth_required
     @api_response
+    @tornado.gen.coroutine
     def get(self):
         finish_ts_gte = int(self.get_argument('finish_ts_gte', default=0)) or None
-        result = manager.unfinished_commands(finish_ts_gte=finish_ts_gte)
+        result = yield self.background_task(manager.unfinished_commands(finish_ts_gte=finish_ts_gte))
 
         # NOTE: filtering out stdout and stderr since mastermind does not use them
         for command in result.itervalues():
@@ -145,6 +167,7 @@ class RsyncListHandler(AuthenticationRequestHandler):
 class CreateGroupHandler(AuthenticationRequestHandler):
     @AuthenticationRequestHandler.auth_required
     @api_response
+    @tornado.gen.coroutine
     def post(self):
         params = {
             k: v[0]
@@ -187,7 +210,7 @@ class CreateGroupHandler(AuthenticationRequestHandler):
                 )
             )
         params['files'] = files
-        uid = manager.run('create_group', params=params)
+        uid = yield self.background_task(manager.run('create_group', params=params))
         self.set_status(302)
         self.add_header('Location', self.reverse_url('status', uid))
 
@@ -196,6 +219,7 @@ class CreateGroupHandler(AuthenticationRequestHandler):
 class RemoveGroupHandler(AuthenticationRequestHandler):
     @AuthenticationRequestHandler.auth_required
     @api_response
+    @tornado.gen.coroutine
     def post(self):
         params = {
             k: v[0]
@@ -216,7 +240,7 @@ class RemoveGroupHandler(AuthenticationRequestHandler):
                     path=params['group_base_path'],
                 )
             )
-        uid = manager.run('remove_group', params=params)
+        uid = yield self.background_task(manager.run('remove_group', params=params))
         self.set_status(302)
         self.add_header('Location', self.reverse_url('status', uid))
 
@@ -225,11 +249,12 @@ class RemoveGroupHandler(AuthenticationRequestHandler):
 class CmdHandler(AuthenticationRequestHandler):
     @AuthenticationRequestHandler.auth_required
     @api_response
+    @tornado.gen.coroutine
     def post(self, cmd):
         params = {
             k: v[0]
             for k, v in self.request.arguments.iteritems()
         }
-        uid = manager.run(cmd, params=params)
+        uid = yield self.background_task(manager.run(cmd, params=params))
         self.set_status(302)
         self.add_header('Location', self.reverse_url('status', uid))
